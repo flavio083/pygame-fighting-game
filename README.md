@@ -86,7 +86,7 @@ pip install pygame
 ## 4 Run the project
 
 ```bash
-python main.py
+python main/main.py
 ```
 
 ---
