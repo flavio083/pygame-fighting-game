@@ -2,12 +2,14 @@
 import pygame
 import random
 import sys
-from time import sleep
 import sqlite3
 
 
 pygame.init()
 
+# Asset caching - prevent runtime I/O during battle
+SPRITE_CACHE = {}
+ATTACK_CACHE = {}
 
 WIDTH, HEIGHT = 1280, 720
 win = pygame.display.set_mode((WIDTH, HEIGHT))
@@ -200,6 +202,50 @@ somdragao = pygame.mixer.Sound("audio/somdragao.mp3"); somdragao.set_volume(0.15
 somtsunami = pygame.mixer.Sound("audio/somtsunami.mp3"); somtsunami.set_volume(0.15)
 
 
+def preload_assets():
+    """Preload all character sprites and attack images into caches"""
+    # Preload character sprites (both orientations, all variants)
+    personagens_todos = ['NARUTO', 'SASUKE', 'KAKASHI', 'TOBIRAMA']
+    sprite_variants = ['', 'dano', 'cura']  # Normal, damage state, heal state
+    
+    for personagem in personagens_todos:
+        for variant in sprite_variants:
+            nome_arquivo = f"{personagem.lower()}{variant}" if variant else personagem.lower()
+            try:
+                # Left-facing sprite
+                caminho = f"sprites/{nome_arquivo}.png"
+                sprite = pygame.image.load(caminho).convert_alpha()
+                sprite = pygame.transform.scale(sprite, (240, 240))
+                SPRITE_CACHE[nome_arquivo] = sprite
+                
+                # Right-facing sprite (flipped)
+                sprite_flip = pygame.transform.flip(sprite, True, False)
+                SPRITE_CACHE[f"{nome_arquivo}_flip"] = sprite_flip
+            except pygame.error:
+                pass  # Skip missing sprites
+    
+    # Preload attack images (all attack types with both orientations)
+    todos_ataques = [
+        "RASENGAN", "CLONES", "PALMA", "MIL ANOS",
+        "CHIDORI", "BOLA DE FOGO", "AMATERASU", "COMBO DO LEAO",
+        "KAMUI", "RAIKIRI", "RAIJIN", "DRAGAO", "TSUNAMI"
+    ]
+    
+    for ataque in todos_ataques:
+        try:
+            nome_arquivo = ataque.lower().replace(' ', '')
+            caminho = f"ataques/{nome_arquivo}.png"
+            imagem = pygame.image.load(caminho).convert_alpha()
+            imagem = pygame.transform.scale(imagem, (80, 80))
+            ATTACK_CACHE[nome_arquivo] = imagem
+            
+            # Flipped version (for PC attacks)
+            imagem_flip = pygame.transform.flip(imagem, True, False)
+            ATTACK_CACHE[f"{nome_arquivo}_flip"] = imagem_flip
+        except pygame.error:
+            pass  # Skip missing attacks
+
+
 # Imagens 
 background = pygame.image.load("fundo/fundo.png")
 background = pygame.transform.scale(background, (WIDTH, HEIGHT))
@@ -216,13 +262,45 @@ letra_index = 0
 ultima_mensagem = ""
 
 
+# Preload all assets before game starts
+preload_assets()
+
+
+# Non-blocking animation and action state tracking
+animation_state = {
+    'active': False,
+    'type': None,  # 'attack', 'sprite_damage', 'wait'
+    'start_time': 0,
+    'duration': 0,
+    'step': 0,
+    'total_steps': 20,
+    'origem': None,
+    'destino': None,
+    'ataque': None,
+    'lado': None,
+    'jogador_afetado': None,
+    'tipo_sprite': None,
+    'imagem': None
+}
+
+sound_wait_state = {
+    'active': False,
+    'start_time': 0,
+    'duration': 0
+}
+
+# Timing constants (in milliseconds)
+ATTACK_ANIMATION_FRAME_MS = 35
+ATTACK_ANIMATION_STEPS = 20
+DAMAGE_SPRITE_DURATION_MS = 1000
+TURN_WAIT_DURATION_MS = 1000
+END_GAME_WAIT_MS = 3000
+
+
 def carregar_sprite(nome, lado='esquerdo'):
-    caminho = f"sprites/{nome.lower()}.png"
-    sprite = pygame.image.load(caminho).convert_alpha()
-    sprite = pygame.transform.scale(sprite, (240, 240))
-    if lado == 'direito':
-        sprite = pygame.transform.flip(sprite, True, False)
-    return sprite
+    # Return sprite from cache instead of loading from disk
+    cache_key = nome.lower() if lado == 'esquerdo' else f"{nome.lower()}_flip"
+    return SPRITE_CACHE.get(cache_key)
 
 
 def atacar(jogador, alvo, ataque):
@@ -278,78 +356,123 @@ def atualizar_barras():
 
 
 def trocar_sprite_dano(jogador, tipo='dano'):
-    global sprite_usuario, sprite_pc
-
-
+    """Trigger sprite damage change (non-blocking - managed by main loop)"""
+    global animation_state, sprite_usuario, sprite_pc
+    
     if jogador == "usuario":
         if tipo == 'cura':
             sprite_usuario = carregar_sprite(usuario.lower() + "cura")
         else:
-            if vida_usuario <= 0: return
+            if vida_usuario <= 0:
+                return
             sprite_usuario = carregar_sprite(usuario.lower() + "dano")
-
-
-        desenhar_luta()
-        desenhar_texto(f"{usuario} ({nome_jogador})", 100, 35, fonte=font_media)
-        desenhar_texto(f"{computador} (PC)", WIDTH - 400, 35, fonte=font_media)
-        desenhar_texto(mensagem, 50, 200, fonte=font_pequena)
-        pygame.display.update()
-        pygame.time.delay(1000)
-        sprite_usuario = carregar_sprite(usuario)
-
-
     else:
         if tipo == 'cura':
             sprite_pc = carregar_sprite(computador.lower() + "cura")
             sprite_pc = pygame.transform.flip(sprite_pc, True, False)
         else:
-            if vida_pc <= 0: return
+            if vida_pc <= 0:
+                return
             sprite_pc = carregar_sprite(computador.lower() + "dano", lado='direito')
+    
+    # Initialize sprite change state
+    animation_state['active'] = True
+    animation_state['type'] = 'sprite_damage'
+    animation_state['start_time'] = pygame.time.get_ticks()
+    animation_state['duration'] = DAMAGE_SPRITE_DURATION_MS
+    animation_state['jogador'] = jogador
+    animation_state['tipo_sprite'] = tipo
 
 
-        desenhar_luta()
-        desenhar_texto(f"{usuario} ({nome_jogador})", 100, 35, fonte=font_media)
-        desenhar_texto(f"{computador} (PC)", WIDTH - 400, 35, fonte=font_media)
-        desenhar_texto(mensagem, 50, 200, fonte=font_pequena)
-        pygame.display.update()
-        pygame.time.delay(1000)
+def atualizar_sprite_normal(jogador):
+    """Restore sprite to normal (called after damage animation)"""
+    global sprite_usuario, sprite_pc
+    
+    if jogador == "usuario":
+        sprite_usuario = carregar_sprite(usuario)
+    else:
         sprite_pc = carregar_sprite(computador, lado='direito')
 
 
+def processar_animacao(current_time):
+    """Process non-blocking animations (called every frame)"""
+    global animation_state, turno, sound_wait_state
+    
+    if not animation_state['active']:
+        return
+    
+    elapsed = current_time - animation_state['start_time']
+    
+    if animation_state['type'] == 'attack':
+        # Attack animation has two phases (20 steps forward, 20 steps back)
+        total_duration = ATTACK_ANIMATION_FRAME_MS * ATTACK_ANIMATION_STEPS * 2
+        
+        if elapsed >= total_duration:
+            # Animation complete - trigger sprite damage change if not REGENERA
+            if animation_state['ataque'] != "REGENERA":
+                trocar_sprite_dano(animation_state['jogador_afetado'])
+            animation_state['active'] = False
+        else:
+            # Update animation step based on elapsed time
+            frame_num = elapsed // ATTACK_ANIMATION_FRAME_MS
+            phase = 0 if frame_num < ATTACK_ANIMATION_STEPS else 1
+            step_in_phase = frame_num % ATTACK_ANIMATION_STEPS
+            
+            # Draw current animation frame
+            t = step_in_phase / ATTACK_ANIMATION_STEPS
+            x = int(animation_state['origem'][0] * (1 - t) + animation_state['destino'][0] * t)
+            y = int(animation_state['origem'][1] * (1 - t) + animation_state['destino'][1] * t)
+            
+            win.blit(animation_state['imagem'], (x, y))
+    
+    elif animation_state['type'] == 'sprite_damage':
+        # Sprite damage state display
+        if elapsed >= animation_state['duration']:
+            # Return to normal sprite
+            atualizar_sprite_normal(animation_state['jogador'])
+            animation_state['active'] = False
+    
+    elif animation_state['type'] == 'wait':
+        # Simple wait state
+        if elapsed >= animation_state['duration']:
+            animation_state['active'] = False
+            turno = "pc" if animation_state.get('next_turn') == 'pc' else "usuario"
+
+
+def iniciar_espera(duration_ms, next_turn=None):
+    """Start a non-blocking wait"""
+    global animation_state
+    
+    animation_state['active'] = True
+    animation_state['type'] = 'wait'
+    animation_state['start_time'] = pygame.time.get_ticks()
+    animation_state['duration'] = duration_ms
+    animation_state['next_turn'] = next_turn
+
+
 def animar_ataque(origem, destino, ataque, lado):
-    passos = 20
-    imagem = pygame.image.load(f"ataques/{ataque.lower().replace(' ', '')}.png").convert_alpha()
-    imagem = pygame.transform.scale(imagem, (80, 80))
-    if lado == 'pc':
-        imagem = pygame.transform.flip(imagem, True, False)
-
-
-    for i in range(passos):
-        t = i / passos
-        x = int(origem[0] * (1 - t) + destino[0] * t)
-        y = int(origem[1] * (1 - t) + destino[1] * t)
-        desenhar_luta()
-        desenhar_texto(f"{usuario} ({nome_jogador})", 100, 35, fonte=font_media)
-        desenhar_texto(f"{computador} (PC)", WIDTH - 400, 35, fonte=font_media)
-        desenhar_texto(mensagem, 50, 200, fonte=font_pequena)
-        win.blit(imagem, (x, y))
-        pygame.display.update()
-        pygame.time.delay(35)
-    if ataque != "REGENERA":
-        trocar_sprite_dano('usuario' if lado == 'pc' else 'pc')
-
-
-    passos = 20
-    for i in range(passos):
-        t = i / passos
-        x = int(origem[0] * (1 - t) + destino[0] * t)
-        y = int(origem[1] * (1 - t) + destino[1] * t)
-        desenhar_luta()
-        desenhar_texto(f"{usuario} ({nome_jogador})", 100, 35, fonte=font_media)
-        desenhar_texto(f"{computador} (PC)", WIDTH - 400, 35, fonte=font_media)
-        desenhar_texto(mensagem, 50, 200, fonte=font_pequena)
-        pygame.display.update()
-        pygame.time.delay(35)
+    """Start attack animation (non-blocking - managed by main loop)"""
+    global animation_state
+    
+    # Get pre-scaled and pre-flipped attack image from cache
+    cache_key = ataque.lower().replace(' ', '') if lado == 'usuario' else f"{ataque.lower().replace(' ', '')}_flip"
+    imagem = ATTACK_CACHE.get(cache_key)
+    if imagem is None:
+        return
+    
+    # Initialize animation state
+    animation_state['active'] = True
+    animation_state['type'] = 'attack'
+    animation_state['start_time'] = pygame.time.get_ticks()
+    animation_state['duration'] = ATTACK_ANIMATION_FRAME_MS * ATTACK_ANIMATION_STEPS * 2  # Two phases
+    animation_state['step'] = 0
+    animation_state['total_steps'] = ATTACK_ANIMATION_STEPS
+    animation_state['origem'] = origem
+    animation_state['destino'] = destino
+    animation_state['ataque'] = ataque
+    animation_state['lado'] = lado
+    animation_state['imagem'] = imagem
+    animation_state['jogador_afetado'] = 'usuario' if lado == 'pc' else 'pc'
 
 
 def desenhar_botoes(ataques):
@@ -394,6 +517,19 @@ def reiniciar_ou_sair():
 clock = pygame.time.Clock()
 turno = "usuario"
 botao_rects = []
+
+# Battle state machine
+battle_state = {
+    'phase': 'waiting',  # 'waiting', 'animating', 'pc_executing', 'end_screen'
+    'ataque_pc': None,
+    'start_time': 0
+}
+
+end_game_state = {
+    'active': False,
+    'start_time': 0,
+    'result': None  # 'player_win' or 'player_loss'
+}
 
 
 while running:
@@ -447,8 +583,9 @@ while running:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            if event.type == pygame.KEYDOWN and event.unicode in "1234":
-                usuario = personagens[int(event.unicode)-1]
+            if event.type == pygame.KEYDOWN:
+                if event.unicode and event.unicode in "1234":
+                    usuario: str = personagens[int(event.unicode) - 1]
                 personagens.remove(usuario)
                 computador = random.choice(personagens)
                 sprite_usuario = carregar_sprite(usuario)
@@ -458,109 +595,164 @@ while running:
 
 
     elif fase == "batalha":
+        current_time = pygame.time.get_ticks()
+        
+        # Process any active animation
+        if animation_state['active']:
+            desenhar_luta()
+            desenhar_texto(f"{usuario} ({nome_jogador})", 100, 40, fonte=font_media)
+            desenhar_texto(f"{computador} (PC)", WIDTH - 400, 40, fonte=font_media)
+            desenhar_texto(mensagem, 50, 200, fonte=font_pequena)
+            processar_animacao(current_time)
+            pygame.display.update()
+            continue
+        
+        # Check for end game conditions
+        if vida_pc <= 0:
+            if not end_game_state['active']:
+                end_game_state['active'] = True
+                end_game_state['start_time'] = current_time
+                end_game_state['result'] = 'player_win'
+                registrar_resultado(nome_jogador, computador, dificuldade)
+            
+            # Show end screen
+            if current_time - end_game_state['start_time'] >= END_GAME_WAIT_MS:
+                # End game screen timeout reached - show ranking
+                desenhar_texto(f"Parabens {nome_jogador}! Voce venceu!", 310, 330, BLUE, fonte=font_grande)
+                pc_derrotado = pygame.transform.rotate(sprite_pc, angulo_pc)
+                win.blit(pc_derrotado, (WIDTH - 290, 500))
+                pygame.display.update()
+                mostrar_ranking_tela()
+                resultado = reiniciar_ou_sair()
+                if resultado == 'reiniciar':
+                    vida_usuario = 100
+                    vida_pc = 100
+                    dificuldade_max = 100
+                    dificuldade_escolhida = False
+                    usuario = ''
+                    computador = ''
+                    personagens = ['NARUTO', 'SASUKE', 'KAKASHI', 'TOBIRAMA']
+                    fase = "dificuldade"
+                    mensagem = ""
+                    turno = "usuario"
+                    end_game_state['active'] = False
+                    battle_state['phase'] = 'waiting'
+                    continue
+                else:
+                    running = False
+            else:
+                # Still waiting before end screen
+                desenhar_texto(f"Parabens {nome_jogador}! Voce venceu!", 310, 330, BLUE, fonte=font_grande)
+                pc_derrotado = pygame.transform.rotate(sprite_pc, angulo_pc)
+                win.blit(pc_derrotado, (WIDTH - 290, 500))
+                pygame.display.update()
+                continue
+        
+        elif vida_usuario <= 0:
+            if not end_game_state['active']:
+                end_game_state['active'] = True
+                end_game_state['start_time'] = current_time
+                end_game_state['result'] = 'player_loss'
+                registrar_resultado(computador, nome_jogador, dificuldade)
+            
+            # Show end screen
+            if current_time - end_game_state['start_time'] >= END_GAME_WAIT_MS:
+                # End game screen timeout reached - show ranking
+                desenhar_texto(f"{nome_jogador} perdeu! Fim de jogo!", 310, 330, RED, fonte=font_grande)
+                usuario_derrotado = pygame.transform.rotate(sprite_usuario, angulo_usuario)
+                win.blit(usuario_derrotado, (50, 500))
+                pygame.display.update()
+                mostrar_ranking_tela()
+                resultado = reiniciar_ou_sair()
+                if resultado == 'reiniciar':
+                    vida_usuario = 100
+                    vida_pc = 100
+                    dificuldade_max = 100
+                    dificuldade_escolhida = False
+                    usuario = ''
+                    computador = ''
+                    personagens = ['NARUTO', 'SASUKE', 'KAKASHI', 'TOBIRAMA']
+                    fase = "dificuldade"
+                    mensagem = ""
+                    turno = "usuario"
+                    end_game_state['active'] = False
+                    battle_state['phase'] = 'waiting'
+                    continue
+                else:
+                    running = False
+            else:
+                # Still waiting before end screen
+                desenhar_texto(f"{nome_jogador} perdeu! Fim de jogo!", 310, 330, RED, fonte=font_grande)
+                usuario_derrotado = pygame.transform.rotate(sprite_usuario, angulo_usuario)
+                win.blit(usuario_derrotado, (50, 500))
+                pygame.display.update()
+                continue
+        
+        # Normal battle flow
         desenhar_luta()
         desenhar_texto(f"{usuario} ({nome_jogador})", 100, 40, fonte=font_media)
         desenhar_texto(f"{computador} (PC)", WIDTH - 400, 40, fonte=font_media)
         desenhar_texto(mensagem, 50, 200, fonte=font_pequena)
-
-
-        if vida_pc <= 0:
-            desenhar_texto(f"Parabens {nome_jogador}! Voce venceu!", 310, 330, BLUE, fonte=font_grande)
-            pc_derrotado = pygame.transform.rotate(sprite_pc, angulo_pc)
-            win.blit(pc_derrotado, (WIDTH - 290, 500))
-            registrar_resultado(nome_jogador, computador, dificuldade)
-            pygame.display.update()
-            pygame.time.delay(3000)
-            mostrar_ranking_tela()
-            resultado = reiniciar_ou_sair()
-            if resultado == 'reiniciar':
-                vida_usuario = 100
-                vida_pc = 100
-                dificuldade_max = 100
-                dificuldade_escolhida = False
-                usuario = ''
-                computador = ''
-                personagens = ['NARUTO', 'SASUKE', 'KAKASHI', 'TOBIRAMA']
-                fase = "dificuldade"
-                mensagem = ""
-                turno = "usuario"
-                continue
-            else:
-                running = False
-        elif vida_usuario <= 0:
-            desenhar_texto(f"{nome_jogador} perdeu! Fim de jogo!", 310, 330, RED, fonte=font_grande)
-            usuario_derrotado = pygame.transform.rotate(sprite_usuario, angulo_usuario)
-            win.blit(usuario_derrotado, (50, 500))
-            registrar_resultado(computador, nome_jogador, dificuldade)
-            pygame.display.update()
-            pygame.time.delay(3000)
-            mostrar_ranking_tela()
-            resultado = reiniciar_ou_sair()
-            if resultado == 'reiniciar':
-                vida_usuario = 100
-                vida_pc = 100
-                dificuldade_max = 100
-                dificuldade_escolhida = False
-                usuario = ''
-                computador = ''
-                personagens = ['NARUTO', 'SASUKE', 'KAKASHI', 'TOBIRAMA']
-                fase = "dificuldade"
-                mensagem = ""
-                turno = "usuario"
-                continue
-            else:
-                running = False
-        elif turno == "usuario":
+        
+        if turno == "usuario":
             desenhar_texto(f"{nome_jogador}, escolha um ataque:", 600, 40, fonte=font_pequena)
             desenhar_botoes(ataques_dict[usuario])
         else:
-            ataque_pc = random.choice(ataques_dict[computador])
-            if ataque_pc == "REGENERA":
-                trocar_sprite_dano("pc", tipo="cura")
-                somregenera.play()
-            elif ataque_pc == "RASENGAN": somrasengan.play()
-            elif ataque_pc == "CHIDORI": somchidori.play()
-            elif ataque_pc == "BOLA DE FOGO": somboladefogo.play()
-            elif ataque_pc == "AMATERASU": somamaterasu.play()
-            elif ataque_pc == "COMBO DO LEAO": somcombodoleao.play()
-            elif ataque_pc == "CLONES": somclones.play()
-            elif ataque_pc == "MIL ANOS": sommilanosdemorte.play()
-            elif ataque_pc == "PALMA": sompalma.play()
-            elif ataque_pc == "REGENERA":
-                trocar_sprite_dano("pc", tipo="cura")
-                somregenera.play()
-            elif ataque_pc == "KAMUI": somkamui.play()
-            elif ataque_pc == "RAIKIRI": somraikiri.play()
-            elif ataque_pc == "RAIJIN": somraijin.play()
-            elif ataque_pc == "DRAGAO": somdragao.play()
-            elif ataque_pc == "TSUNAMI": somtsunami.play()
-            animar_ataque((WIDTH - 250, 450), (220, 450), ataque_pc, 'pc')
-            atacar("pc", "usuario", ataque_pc)
-            atualizar_barras()
-            pygame.display.update()
-            turno = "usuario"
-            pygame.time.delay(1000)
-
-
+            # PC turn - non-blocking execution
+            if battle_state['phase'] == 'waiting':
+                # Start PC turn
+                ataque_pc = random.choice(ataques_dict[computador])
+                battle_state['ataque_pc'] = ataque_pc
+                battle_state['phase'] = 'pc_executing'
+                battle_state['start_time'] = current_time
+            
+            elif battle_state['phase'] == 'pc_executing':
+                # Execute PC attack with updated HP BEFORE animation
+                if current_time - battle_state['start_time'] < 100:  # Small delay to register choice
+                    continue
+                
+                # Play sound
+                ataque_pc = battle_state['ataque_pc']
+                if ataque_pc == "REGENERA": somregenera.play()
+                elif ataque_pc == "RASENGAN": somrasengan.play()
+                elif ataque_pc == "CHIDORI": somchidori.play()
+                elif ataque_pc == "BOLA DE FOGO": somboladefogo.play()
+                elif ataque_pc == "AMATERASU": somamaterasu.play()
+                elif ataque_pc == "COMBO DO LEAO": somcombodoleao.play()
+                elif ataque_pc == "CLONES": somclones.play()
+                elif ataque_pc == "MIL ANOS": sommilanosdemorte.play()
+                elif ataque_pc == "PALMA": sompalma.play()
+                elif ataque_pc == "KAMUI": somkamui.play()
+                elif ataque_pc == "RAIKIRI": somraikiri.play()
+                elif ataque_pc == "RAIJIN": somraijin.play()
+                elif ataque_pc == "DRAGAO": somdragao.play()
+                elif ataque_pc == "TSUNAMI": somtsunami.play()
+                
+                # UPDATE HP BEFORE ANIMATION - THIS IS THE KEY FIX
+                if ataque_pc == "REGENERA":
+                    trocar_sprite_dano("pc", tipo="cura")
+                    vida_pc = min(dificuldade_max, vida_pc - ataques_dano.get("REGENERA", 0))
+                    mensagem = f"{computador} se regenerou ({abs(ataques_dano.get('REGENERA', 0))} de vida)!"
+                else:
+                    vida_usuario = max(0, vida_usuario - ataques_dano.get(ataque_pc, 0))
+                    mensagem = f"{computador} usou {ataque_pc} causando {ataques_dano.get(ataque_pc, 0)} de dano!"
+                
+                # NOW animate attack
+                animar_ataque((WIDTH - 250, 450), (220, 450), ataque_pc, 'pc')
+                battle_state['phase'] = 'waiting'
+                turno = "usuario"
+        
         pygame.display.update()
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
-            if turno == "usuario" and event.type == pygame.MOUSEBUTTONDOWN:
+            if turno == "usuario" and event.type == pygame.MOUSEBUTTONDOWN and battle_state['phase'] == 'waiting':
                 pos = pygame.mouse.get_pos()
                 for rect, ataque in botao_rects:
                     if rect.collidepoint(pos):
-                        if ataque == "REGENERA":
-                            trocar_sprite_dano("usuario", tipo="cura")
-                            somregenera.play()
-                            atacar("usuario", "pc", ataque)
-                            atualizar_barras()
-                            pygame.display.update()
-                            while pygame.mixer.get_busy():
-                                pygame.time.wait(100)
-                            turno = "pc"
-                            break
-                        if ataque == "RASENGAN": somrasengan.play()
+                        # Play sound first
+                        if ataque == "REGENERA": somregenera.play()
+                        elif ataque == "RASENGAN": somrasengan.play()
                         elif ataque == "CHIDORI": somchidori.play()
                         elif ataque == "BOLA DE FOGO": somboladefogo.play()
                         elif ataque == "AMATERASU": somamaterasu.play()
@@ -568,21 +760,25 @@ while running:
                         elif ataque == "CLONES": somclones.play()
                         elif ataque == "MIL ANOS": sommilanosdemorte.play()
                         elif ataque == "PALMA": sompalma.play()
-                        elif ataque == "REGENERA":
-                            trocar_sprite_dano("usuario", tipo="cura")
-                            somregenera.play()
                         elif ataque == "KAMUI": somkamui.play()
                         elif ataque == "RAIKIRI": somraikiri.play()
                         elif ataque == "RAIJIN": somraijin.play()
                         elif ataque == "DRAGAO": somdragao.play()
                         elif ataque == "TSUNAMI": somtsunami.play()
+                        
+                        # UPDATE HP BEFORE ANIMATION - THIS IS THE KEY FIX
+                        if ataque == "REGENERA":
+                            trocar_sprite_dano("usuario", tipo="cura")
+                            vida_usuario = min(100, vida_usuario - ataques_dano.get("REGENERA", 0))
+                            mensagem = f"{nome_jogador} se regenerou ({abs(ataques_dano.get('REGENERA', 0))} de vida)!"
+                        else:
+                            vida_pc = max(0, vida_pc - ataques_dano.get(ataque, 0))
+                            mensagem = f"{nome_jogador} usou {ataque} causando {ataques_dano.get(ataque, 0)} de dano!"
+                        
+                        # NOW animate attack
                         animar_ataque((220, 450), (WIDTH - 250, 450), ataque, 'usuario')
-                        atacar("usuario", "pc", ataque)
-                        atualizar_barras()
-                        pygame.display.update()
-                        while pygame.mixer.get_busy():
-                            pygame.time.wait(100)
                         turno = "pc"
+                        battle_state['phase'] = 'waiting'
                         break
 
 
